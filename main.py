@@ -33,7 +33,7 @@ sprint_agent = SprintAllocatorAgent()
 criteria_agent = AcceptanceCriteriaAgent()
 
 # ----- API Route -----
-@app.post("/plan-sprint")
+@app.post("/")
 async def plan_sprint(input: ProjectInput):
     """
     Main route to accept project description and return structured sprint plan.
