@@ -1,6 +1,7 @@
 import httpx
 import json
 import logging
+import traceback
 from app.config import NODE_BASE_URL, NODE_API_KEY, NODE_API_KEY_HEADER, NODE_API_KEY_PREFIX, NODE_COOKIE
 from app.models.project_member import ProjectMember
 from app.models.task import Task
@@ -96,6 +97,7 @@ class DataLoader:
             print(f"✅ [SUCCESS] {len(self.members)} members parsed and loaded.")
         except Exception as e:
             print(f"❌ [ERROR] Failed to fetch members: {e}")
+            print(traceback.format_exc())
             self.members = []
         return self.members
 
@@ -143,6 +145,7 @@ class DataLoader:
             print(f"✅ [SUCCESS] {len(self.tasks)} tasks parsed and loaded.")
         except Exception as e:
             print(f"❌ [ERROR] Failed to fetch tasks: {e}")
+            print(traceback.format_exc())
             from datetime import date, timedelta
             fallback = [
                 {
