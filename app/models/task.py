@@ -1,5 +1,18 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Union
+
+
+class Avatar(BaseModel):
+    public_id: Optional[str] = ""
+    url: Optional[str] = ""
+
+
+class AssignedUser(BaseModel):
+    _id: Optional[str] = None
+    name: Optional[str] = None
+    email: Optional[str] = None
+    role: Optional[str] = None
+    avatar: Optional[Avatar] = None
 
 
 class Task(BaseModel):
@@ -8,8 +21,10 @@ class Task(BaseModel):
     title: str
     priority: str
     status: str
-    assignedTo: Optional[str]
-    dueDate: Optional[str] = None   # ✅ use dueDate instead of deadlineDays
+    # ✅ Fix: Allow either user ID (string) or full user object
+    assignedTo: Optional[Union[str, AssignedUser]] = None
+
+    dueDate: Optional[str] = None
     estimatedHours: float = 4.0
     queueOrder: Optional[int] = 0
     businessValue: Optional[int] = 1
@@ -22,3 +37,15 @@ class Task(BaseModel):
     @property
     def _id(self) -> str:
         return self.id
+
+    def model_dump(self, **kwargs):
+        """Safe dump to ensure assignedTo is always an ID string."""
+        base = super().model_dump(by_alias=True, **kwargs)
+        assigned = base.get("assignedTo")
+
+        # If assignedTo is a nested object, extract the ID
+        if isinstance(assigned, dict):
+            base["assignedTo"] = assigned.get("_id") or None
+        elif hasattr(self.assignedTo, "_id"):
+            base["assignedTo"] = self.assignedTo._id
+        return base
