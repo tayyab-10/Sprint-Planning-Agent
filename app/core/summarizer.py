@@ -1,30 +1,69 @@
-import os
-import logging
-import traceback
+import json
 import asyncio
-import google.generativeai as genai
+import os
+from typing import List, Dict, Any
 
-logger = logging.getLogger(__name__)
+# Ensure 'requests' is imported for the synchronous call in the background thread
+try:
+    import requests
+except ImportError:
+    # Handle the case where requests might not be installed (for environment checks)
+    print("Warning: 'requests' library not found. AI summary will use fallback.")
 
-# Load Gemini API key
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# Define constants for the Gemini API call
+MODEL_NAME = "gemini-2.5-flash-preview-09-2025"
+API_KEY = os.getenv("GEMINI_API_KEY")
+API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={API_KEY}"
 
-if not GEMINI_API_KEY:
-    logger.warning("⚠️ GEMINI_API_KEY not set. AI summaries will use fallback.")
-else:
-    genai.configure(api_key=GEMINI_API_KEY)
+# ------------------------------------------------------
+# Diverse Fallback Goals
+# ------------------------------------------------------
+# FIX: Use diverse, categorized fallbacks to avoid repetition (Point 3)
+FALLBACK_GOALS = [
+    # Delivery Goals
+    "Finalize and merge all code for high-priority features (Delivery Goal).",
+    "Complete the implementation of the primary backend ingestion API (Delivery Goal).",
+    # Quality Goals
+    "Achieve 100% unit test coverage for all newly implemented features (Quality Goal).",
+    "Resolve all identified P1 and P2 bugs from the current backlog (Quality Goal).",
+    # Risk/Dependency Goals
+    "Validate and document the finalized API specification with the consuming frontend team (Risk/Dependency Goal).",
+    "Set up the foundational CI/CD pipeline to de-risk future deployments (Risk/Dependency Goal)."
+]
 
 
-async def generate_sprint_summary(tasks):
+# --- Exponential Backoff Helper (Crucial for robust API calls) ---
+
+async def fetch_with_retry(url, payload, headers, max_retries=3):
+    """Fetches API response with exponential backoff."""
+    delay = 1
+    for attempt in range(max_retries):
+        try:
+            # We use asyncio.to_thread to run the blocking 'requests.post' call asynchronously
+            response = await asyncio.to_thread(
+                lambda: requests.post(url, headers=headers, data=json.dumps(payload), timeout=30)
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            if attempt == max_retries - 1:
+                # Log error on final failure
+                print(f"Final API call failed after {max_retries} retries: {e}")
+                raise
+            await asyncio.sleep(delay)
+            delay *= 2
+            
+# --- Core Generation Function ---
+
+async def generate_sprint_summary(tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Dynamically generates a sprint summary and goals using Gemini AI.
-    Adapts tone, goal count, and focus based on the number and nature of tasks.
+    Generates AI Summary, Confidence, and SMART Goals using Gemini API, 
+    with dynamic goal counting based on sprint size and category.
     """
-    task_titles = [getattr(t, "title", str(t)) for t in tasks]
-    total_tasks = len(task_titles)
-    top_titles = ", ".join(task_titles[:5]) or "general tasks"
-
-    # ✅ Determine tone and goal count based on sprint size
+    
+    # 1. Determine dynamic goal count and sprint type
+    total_tasks = len(tasks)
+    
     if total_tasks <= 3:
         goal_count = 2
         sprint_type = "light sprint focused on quick wins"
@@ -35,114 +74,93 @@ async def generate_sprint_summary(tasks):
         goal_count = 5
         sprint_type = "intensive sprint addressing complex objectives"
 
-    # ✅ Default fallback (used when AI fails)
+    # Define a clean fallback that uses the dynamically set variables
     fallback = {
-        "aiSummary": f"This is a {sprint_type}. Tasks include: {top_titles}. Team should prioritize efficiency and alignment.",
-        "aiConfidence": 0.0,
-        "goals": [
-            "Complete high-priority tasks efficiently",
-            "Ensure code quality and testing coverage",
-            "Maintain strong communication across the team"
-        ][:goal_count]
+        "aiSummary": f"This is a {sprint_type} with {total_tasks} tasks. Team should prioritize efficiency and alignment.",
+        "aiConfidence": 0.0, # Point 1: Fallback remains 0.0 when AI fails completely
+        "goals": FALLBACK_GOALS[:goal_count]
+    }
+    
+    if 'requests' not in globals() or not tasks:
+        return fallback
+        
+    # 2. Create clean task data for the LLM prompt
+    clean_task_data = [
+        {
+            "title": t.get('title'),
+            "type": t.get('type', 'N/A'),
+            "effort": f"{t.get('estimatedHours', 8.0)}h",
+            "assignedTo": t.get('assignedTo')
+        }
+        for t in tasks
+    ]
+    
+    # Point 5 & 3: Enhanced prompt for better summary and categorized goals
+    user_query = f"""
+    Analyze the following {sprint_type} tasks planned for the sprint (Total tasks: {total_tasks}).
+
+    Generate:
+    1. A concise, professional **Summary** (1-2 sentences) of the sprint's focus, emphasizing the *value* being delivered and the primary technical area (e.g., "backend API foundations").
+    2. Exactly {goal_count} **SMART Goals**. These must be categorized as: Delivery Goal, Quality Goal, or Risk/Dependency Goal.
+    3. An objective **Confidence Score** (0.0 to 1.0) on the plan's achievability.
+
+    Tasks:
+    {json.dumps(clean_task_data, indent=2)}
+
+    Your response MUST contain ONLY the JSON object and no commentary.
+    """
+    
+    # 3. Define System Instruction and Structured Output Schema
+    system_prompt = "You are an expert Agile Coach and AI Sprint Planner. Your job is to analyze the assigned tasks for a sprint and generate an insightful summary, categorized SMART goals, and an objective confidence score for the plan. Respond STRICTLY in JSON."
+    
+    response_schema = {
+        "type": "OBJECT",
+        "properties": {
+            "aiSummary": {"type": "STRING", "description": "A concise, professional summary of the sprint's focus and delivered value (1-2 sentences)."},
+            "aiConfidence": {"type": "NUMBER", "description": "Confidence score (0.0 to 1.0) reflecting the perceived success of completing all tasks."},
+            "goals": {
+                "type": "ARRAY",
+                "description": f"Exactly {goal_count} specific, measurable, and categorized SMART goals (Delivery, Quality, Risk/Dependency).",
+                "items": {"type": "STRING"}
+            }
+        },
+        "required": ["aiSummary", "aiConfidence", "goals"]
     }
 
-    if not GEMINI_API_KEY:
-        logger.debug("GEMINI_API_KEY missing. Returning fallback summary.")
-        return fallback
-
-    try:
-        # 🔹 Build dynamic prompt
-        task_list = "\n".join([f"- {t}" for t in task_titles[:10]])
-        prompt = f"""
-        You are an expert Agile Sprint Planner AI.
-        Analyze these sprint tasks:
-        {task_list}
-
-        Sprint Type: {sprint_type}
-        Total Tasks: {total_tasks}
-
-        Generate:
-        1. A concise 3–4 line **summary** describing the sprint focus, work type, and dependencies.
-        2. {goal_count} short and actionable **goals** (use bullet points).
-
-        Format strictly as:
-
-        SUMMARY:
-        <summary text>
-
-        GOALS:
-        - goal 1
-        - goal 2
-        - goal 3 ...
-        """
-
-        # Run Gemini safely in a background thread
-        loop = asyncio.get_event_loop()
-        raw_text = await loop.run_in_executor(None, _call_gemini, prompt)
-
-        if not raw_text:
-            logger.warning("Gemini returned empty response; using fallback.")
-            return fallback
-
-        summary_text, goals = _parse_summary_and_goals(raw_text)
-
-        # ✅ Ensure goals array has the expected length
-        if not goals or len(goals) < goal_count:
-            goals = fallback["goals"]
-
-        return {
-            "aiSummary": summary_text.strip() if summary_text else fallback["aiSummary"],
-            "aiConfidence": 0.9 if summary_text else 0.0,
-            "goals": goals
+    payload = {
+        "contents": [{ "parts": [{ "text": user_query }] }],
+        "systemInstruction": { "parts": [{ "text": system_prompt }] },
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": response_schema
         }
-
-    except Exception as e:
-        logger.error(f"❌ [AI ERROR] Gemini summary failed: {e}")
-        logger.debug(traceback.format_exc())
-        return fallback
-
-
-def _call_gemini(prompt: str) -> str:
-    """
-    Safe, synchronous Gemini API call run in executor (thread).
-    Prevents blocking the main FastAPI loop.
-    """
-    try:
-        model = genai.GenerativeModel("gemini-2.0-flash-exp")  # ✅ stable, fast model
-        response = model.generate_content(prompt)
-        return getattr(response, "text", "") or ""
-    except Exception as e:
-        print(f"❌ [Gemini API ERROR in thread]: {e}")
-        return ""
-
-
-def _parse_summary_and_goals(text: str):
-    """
-    Parse summary and goals from Gemini's formatted text response.
-    """
-    summary_text = ""
-    goals = []
-
-    try:
-        lines = text.splitlines()
-        in_goals = False
-
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            if line.upper().startswith("SUMMARY"):
-                continue
-            elif line.upper().startswith("GOALS"):
-                in_goals = True
-                continue
-            elif in_goals and line.startswith("-"):
-                goals.append(line.lstrip("-").strip())
-            elif not in_goals:
-                summary_text += line + " "
-
-        summary_text = summary_text.strip()
-    except Exception as e:
-        print(f"⚠️ Failed to parse AI response: {e}")
+    }
     
-    return summary_text, goals
+    headers = { 'Content-Type': 'application/json' }
+    
+    # 4. API Call and Parsing
+    try:
+        result = await fetch_with_retry(API_URL, payload, headers)
+
+        candidate = result.get('candidates', [{}])[0]
+        json_text = candidate.get('content', {}).get('parts', [{}])[0].get('text')
+        
+        if json_text:
+            if json_text.strip().startswith("```json"):
+                json_text = json_text.strip().lstrip("```json").rstrip("```")
+                
+            ai_data = json.loads(json_text)
+            ai_data['aiConfidence'] = float(ai_data.get('aiConfidence', 0.5))
+            
+            # FIX: If the AI failed to hit the exact goal count, use the diverse fallback goals
+            if len(ai_data.get("goals", [])) != goal_count:
+                ai_data["goals"] = FALLBACK_GOALS[:goal_count] 
+            
+            # Point 1: If AI generated a summary, we use its confidence (0.0 < confidence <= 1.0)
+            return ai_data
+        
+    except Exception as e:
+        print(f"Gemini API call failed or JSON parsing failed: {e}")
+        return fallback # Return diverse fallback on API or parsing error
+        
+    return fallback

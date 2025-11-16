@@ -1,43 +1,61 @@
-from datetime import datetime, date, timedelta
+from app.models.task import Task
+from typing import Any
 
+# ------------------------------------------------------
+# CONFIG CONSTANTS for Scoring
+# ------------------------------------------------------
 
-def compute_task_score(task):
-    """Compute a numeric score for a Task.
+# Weights for scoring calculation
+PRIORITY_WEIGHTS = {
+    "Critical": 4.0,
+    "High": 3.0,
+    "Medium": 2.0,
+    "Low": 1.0,
+    "Trivial": 0.5,
+}
 
-    Urgency is derived from `dueDate` (ISO date string) if present. If not,
-    fall back to a legacy `deadlineDays` numeric field when available. If
-    neither is present we assume a default of 5 days (low urgency).
+# Value based on task type (e.g., core features over minor fixes)
+TYPE_VALUE = {
+    "Feature": 1.5,
+    "Bug": 1.2,
+    "Refactor": 1.0,
+    "Documentation": 0.8,
+    "Other": 1.0,
+}
+
+# ------------------------------------------------------
+# Core Scoring Function
+# ------------------------------------------------------
+
+def compute_task_score(task: Any) -> float:
     """
-    priority_map = {"Low": 1, "Medium": 2, "High": 3, "Critical": 5}
-    pr = priority_map.get(getattr(task, "priority", None), 2)
+    Calculates a composite prioritization score for a task.
+    Score = (Priority Weight * Type Value * Urgency Boost) / Effort Factor
+    """
+    
+    # Safely get priority, effort, and type attributes
+    priority_str = getattr(task, 'priority', 'Medium')
+    task_type = getattr(task, 'type', 'Other')
+    
+    # Get effort, defaulting to a non-zero value if missing or zero (FIX)
+    raw_effort = getattr(task, 'estimatedHours', 8.0)
+    
+    # 1. Effort Factor (Use a minimum of 8.0 if input is 0 or less)
+    effort_factor = max(raw_effort if raw_effort is not None else 1.0, 1.0) 
+    
+    # 2. Priority Weight
+    priority_weight = PRIORITY_WEIGHTS.get(priority_str, 1.0)
+    
+    # 3. Type Value
+    type_value = TYPE_VALUE.get(task_type, 1.0)
+    
+    # 4. Due Date Urgency (Simple multiplier for tasks due soon)
+    title = getattr(task, 'title', '').lower()
+    urgency_boost = 1.0
+    if "urgent" in title or "critical" in title:
+        urgency_boost = 1.25
 
-    # Determine days until due
-    days_until = None
-    due = getattr(task, "dueDate", None)
-    if due:
-        # try parse ISO date/time or a plain integer string
-        try:
-            dt = datetime.fromisoformat(due)
-            days_until = (dt.date() - date.today()).days
-        except Exception:
-            try:
-                # maybe the API sent a simple integer (days)
-                days_until = int(due)
-            except Exception:
-                days_until = None
-
-    # legacy fallback if model still has deadlineDays attr
-    if days_until is None and hasattr(task, "deadlineDays"):
-        try:
-            days_until = int(getattr(task, "deadlineDays") or 5)
-        except Exception:
-            days_until = None
-
-    if days_until is None:
-        days_until = 5
-
-    urgency = 5 - min(5, max(0, days_until))
-
-    value = getattr(task, "businessValue", 1) or 1
-    effort = max(1, getattr(task, "estimatedHours", 4.0) / 4)
-    return (pr * 2) + value + urgency - effort
+    # Composite Score
+    score = (priority_weight * type_value * urgency_boost) / effort_factor
+    
+    return round(score * 10, 2) # Scale the score for better visibility in logs
