@@ -30,32 +30,42 @@ TYPE_VALUE = {
 def compute_task_score(task: Any) -> float:
     """
     Calculates a composite prioritization score for a task.
+    Accepts either a Pydantic Task-like object or a plain dict.
     Score = (Priority Weight * Type Value * Urgency Boost) / Effort Factor
+    Returns a scaled score (0..~40) depending on inputs.
     """
-    
-    # Safely get priority, effort, and type attributes
-    priority_str = getattr(task, 'priority', 'Medium')
-    task_type = getattr(task, 'type', 'Other')
-    
-    # Get effort, defaulting to a non-zero value if missing or zero (FIX)
-    raw_effort = getattr(task, 'estimatedHours', 8.0)
-    
-    # 1. Effort Factor (Use a minimum of 8.0 if input is 0 or less)
-    effort_factor = max(raw_effort if raw_effort is not None else 1.0, 1.0) 
-    
+
+    # Support dicts and objects
+    if isinstance(task, dict):
+        priority_str = task.get('priority', 'Medium')
+        task_type = task.get('type', 'Other')
+        raw_effort = task.get('estimatedHours', 8.0)
+        title = (task.get('title') or '').lower()
+    else:
+        priority_str = getattr(task, 'priority', 'Medium')
+        task_type = getattr(task, 'type', 'Other')
+        raw_effort = getattr(task, 'estimatedHours', 8.0)
+        title = (getattr(task, 'title', '') or '').lower()
+
+    # 1. Effort Factor (Use a minimum of 1.0 to avoid division-by-zero)
+    try:
+        effort_factor = max(float(raw_effort) if raw_effort is not None else 1.0, 1.0)
+    except Exception:
+        effort_factor = 8.0
+
     # 2. Priority Weight
     priority_weight = PRIORITY_WEIGHTS.get(priority_str, 1.0)
-    
+
     # 3. Type Value
     type_value = TYPE_VALUE.get(task_type, 1.0)
-    
-    # 4. Due Date Urgency (Simple multiplier for tasks due soon)
-    title = getattr(task, 'title', '').lower()
+
+    # 4. Urgency Boost
     urgency_boost = 1.0
     if "urgent" in title or "critical" in title:
         urgency_boost = 1.25
 
     # Composite Score
     score = (priority_weight * type_value * urgency_boost) / effort_factor
-    
-    return round(score * 10, 2) # Scale the score for better visibility in logs
+
+    # Scale into a more visible range
+    return round(score * 10, 2)

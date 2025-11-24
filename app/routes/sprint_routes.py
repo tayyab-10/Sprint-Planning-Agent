@@ -1,7 +1,10 @@
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Body
+from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict
 
+# Import the new, comprehensive models and the planner function
+from app.models.project_member import ProjectMember
+from app.models.sprint import SprintPlanOutput
 from app.core.planner_engine import plan_single_sprint
 from app.core.data_loader import DataLoader
 
@@ -11,99 +14,102 @@ router = APIRouter()
 # Helper: extract Authorization + Cookie headers
 # ---------------------------------------------------------
 def _build_forward_headers(request: Request) -> Dict[str, str]:
+    """Extracts Authorization and Cookie headers to forward to the Node backend."""
     headers = {}
 
-    if "authorization" in request.headers:
-        headers["Authorization"] = request.headers.get("authorization")
+    # Normalize keys to lowercase for robust lookup
+    req_headers = {k.lower(): v for k, v in request.headers.items()}
 
-    if "cookie" in request.headers:
-        headers["Cookie"] = request.headers.get("cookie")
+    if "authorization" in req_headers:
+        headers["Authorization"] = req_headers["authorization"]
 
-    # Optional custom headers (good practice)
-    if "x-user-id" in request.headers:
-        headers["X-User-Id"] = request.headers.get("x-user-id")
+    if "cookie" in req_headers:
+        headers["Cookie"] = req_headers["cookie"]
+
+    if "x-user-id" in req_headers:
+        headers["X-User-Id"] = req_headers["x-user-id"]
 
     return headers
 
 
 # ---------------------------------------------------------
-# Request models (Standardized for '_id' property access)
+# Request Models (Using the rich ProjectMember model)
 # ---------------------------------------------------------
-class MemberModel(BaseModel):
-    # Use 'id' internally, but accept '_id' from incoming JSON payload
-    id: str = Field(..., alias="_id") 
+
+class SprintPlanningRequest(BaseModel):
+    """
+    Input model matching the necessary data required by the Sprint Planner Agent.
+    """
+    # Use the comprehensive Pydantic model for member validation
+    members: List[ProjectMember] = Field(..., description="List of all project members with capacity and reliability metrics.")
     
-    name: Optional[str] = None
-    role: Optional[str] = None
-    availabilityPct: float = 1.0
-    hourlyCapacity: float = 40.0
-    velocity: Optional[int] = 0
-    reliability: Optional[float] = 0.5
-    # Optional client-provided cap for max tasks this member may take
-    effective_max_tasks: Optional[int] = None
+    # NEW: Pass the full sprint configuration (length, goals, etc.)
+    sprint_config: Dict[str, Any] = Field(..., description="Details like sprintLengthDays, workHoursPerDay, fixedDeadlineConstraints.")
     
-    # This property ensures that the planner_engine (which uses m._id) can still access the ID.
-    @property
-    def _id(self) -> str:
-        return self.id
-
-    class Config:
-        # Allows Pydantic to accept `_id` in the input and map it to the `id` field
-        allow_population_by_field_name = True 
-        # Allows the @property `_id` to be accessed without generating a validation error
-        ignored_properties = ["_id"]
-
-
-class SprintPlanRequest(BaseModel):
-    duration: int = 7
-    members: List[MemberModel]
-    # NEW: Maximum number of tasks to assign per member (optional limit)
+    # Note: maxTasksPerMember is now ideally derived from capacity within the planner, 
+    # but we can retain the field if the client must override it.
     maxTasksPerMember: Optional[int] = None 
 
 
 # ---------------------------------------------------------
 # POST /api/sprint/plan/{project_id}
 # ---------------------------------------------------------
-@router.post("/plan/{project_id}")
-async def generate_sprint_plan(project_id: str, req: SprintPlanRequest, request: Request):
+@router.post("/plan/{project_id}", response_model=SprintPlanOutput)
+async def generate_sprint_plan(
+    project_id: str,
+    request: Request,
+    req: SprintPlanningRequest = Body(...),
+) -> SprintPlanOutput:
     try:
-        # 1. Forward headers to Node backend
-        incoming = _build_forward_headers(request)
-        
-        # FIX: Check for debug query parameter
+        # 1. Prepare Environment
+        incoming_headers = _build_forward_headers(request)
         debug_mode = request.query_params.get("debug", "false").lower() == "true"
-
-        # 2. Load all project tasks from Node
-        loader = DataLoader(project_id, incoming_headers=incoming)
-        tasks = await loader.fetch_project_tasks()
-
-        if not tasks:
-            raise HTTPException(400, "No tasks available for sprint planning")
-
-        if not req.members:
-            raise HTTPException(400, "No project members provided")
-
-        # 3. Run the new AI single sprint planner
-        sprint = await plan_single_sprint(
+        
+        loader = DataLoader(project_id, incoming_headers=incoming_headers)
+        
+        # 2. Load Data (Members from Body, Tasks/Config from API)
+        
+        # A. Load RICH Member data from the request body (crucial for capacity calculation)
+        # `req.members` will be a list of Pydantic `ProjectMember` models; convert to dicts
+        # so DataLoader can normalize and re-construct models as needed.
+        loader.load_members_from_request_body([m.model_dump() for m in req.members])
+        
+        # B. Fetch Tasks, Project Details, and Fallback Config from the Node API
+        project_data = await loader.get_project_data()
+        
+        # 3. Execute Planning Logic
+        
+        # Merge the config from the request body with any fallback config loaded from the API
+        final_sprint_config = {
+            **project_data.get("sprint_config", {}), # API fallback config
+            **req.sprint_config                      # Client-provided/overriding config
+        }
+        
+        # The new plan_single_sprint now takes the full sprint_config dictionary
+        final_plan_data = await plan_single_sprint(
             project_id=project_id,
-            members=req.members,
-            tasks=tasks,
-            sprint_duration=req.duration,
-            max_tasks_per_member=req.maxTasksPerMember,
-            debug_mode=debug_mode # Pass debug flag
+            members=project_data["members"],
+            tasks=project_data["tasks"],
+            sprint_config=final_sprint_config,
+            debug_mode=debug_mode
         )
 
-        # FIX: Wrap the single sprint object in an array as required by the contract
-        return {
-            "success": True,
-            "projectId": project_id,
-            "sprints": [sprint] 
-        }
+        # 4. Return the Final Plan
+        # Return the validated SprintPlanOutput object directly. 
+        # We do NOT wrap it in {"sprints": [sprint]} unless the client explicitly expects that wrapper.
+        # The agent's contract only requires the SprintPlanOutput JSON.
+        return SprintPlanOutput(**final_plan_data)
 
+    except HTTPException:
+        # Re-raise explicit HTTP exceptions (e.g., 400 No tasks available)
+        raise
+        
     except Exception as e:
         # Log the actual error for better debugging
-        print(f"ERROR during sprint planning for project {project_id}: {e}")
-        return {
-            "success": False,
-            "message": f"Sprint planning failed: {str(e)}"
-        }
+        print(f"FATAL ERROR during sprint planning for project {project_id}: {e}")
+        # Return the error in the required output format (success: False)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Sprint planning failed: {str(e)}",
+            headers={"X-Failure-Reason": "Agent internal error"}
+        )
